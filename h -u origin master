@@ -1,0 +1,15 @@
+[33md4aa73f[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m)[m inital commit
+.gitignore
+README.md
+agent1/.dockerignore
+agent1/.env.example
+agent1/Dockerfile
+agent1/main.py
+agent1/requirements.txt
+agent2/.dockerignore
+agent2/.env.example
+agent2/Dockerfile
+agent2/main.py
+agent2/requirements.txt
+docker-compose.yml
+nginx/nginx.conf
