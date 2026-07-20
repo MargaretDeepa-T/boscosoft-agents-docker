@@ -1,0 +1,8 @@
+.venv
+venv
+__pycache__
+*.pyc
+.env
+*.xlsx
+*.json
+Dynamic Report_files/
