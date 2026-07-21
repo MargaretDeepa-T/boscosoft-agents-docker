@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 
 import pandas as pd
@@ -20,19 +21,19 @@ GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "openai/gpt-oss-120b",
 ).strip()
+BULK_MAX_WORKERS = max(
+    1,
+    int(os.getenv("BULK_MAX_WORKERS", "5")),
+)
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is missing in .env")
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# app = FastAPI(
-#     title="Boscosoft Task Validation API",
-#     version="1.2.0",
-# )
 app = FastAPI(
     title="Boscosoft Task Validation API",
-    root_path="/agent1"
+    version="1.2.0",
 )
 
 
@@ -48,9 +49,19 @@ class TaskInput(BaseModel):
     assignee: str = ""
 
 
+Decision = Literal[
+    "PROCEED",
+    "REVIEW_ESTIMATE",
+    "REWRITE_TASK",
+    "REWRITE_AND_REESTIMATE",
+    "CANNOT_VALIDATE_ESTIMATE",
+    "ERROR",
+]
+
+
 class ValidationResult(BaseModel):
     task_id: str
-    decision: str
+    decision: Decision
 
     task_title_assessment: str
     task_description_assessment: str
@@ -120,6 +131,8 @@ Mandatory output rules:
 - Do not use text such as "No changes required" in suggested fields.
 - Use cautious wording such as appears reasonable, may be low, or may be high.
 - Human review is always required before applying changes.
+The estimate is an AI-generated review recommendation based only on the
+provided task information. It is not an authoritative project estimate.
 """
 
 
@@ -240,11 +253,23 @@ def hours_to_decimal(value: Any) -> float:
     return 0.0
 
 
-def build_prompt(task: TaskInput) -> str:
+def build_prompt(
+    task: TaskInput,
+    project: str | None = None,
+    sprint: str | None = None,
+) -> str:
+    validation_context = {
+        "project": clean_text(project),
+        "sprint": clean_text(sprint),
+    }
+
     return f"""
 Evaluate this backlog task:
 
 {task.model_dump_json(indent=2)}
+
+Additional validation context:
+{json.dumps(validation_context, indent=2)}
 
 Return only JSON in this exact structure:
 
@@ -259,7 +284,7 @@ Return only JSON in this exact structure:
   "suggested_task_description": "Always return the original description or a corrected description",
   "suggested_estimated_hours": {task.estimated_hours},
   "confidence_score": 0.0,
-  "recommendation": "A concise recommendation for human review"
+  "recommendation": "A concise recommendation for human review, clearly stating that the estimate is AI-generated and requires human approval"
 }}
 
 Important:
@@ -397,12 +422,17 @@ def request_groq_validation(
 def build_estimate_correction_prompt(
     task: TaskInput,
     parsed: dict[str, Any],
+    project: str | None = None,
+    sprint: str | None = None,
 ) -> str:
     return f"""
 The previous validation response is inconsistent.
 
 Original task:
 {task.model_dump_json(indent=2)}
+
+Validation context:
+{json.dumps({"project": clean_text(project), "sprint": clean_text(sprint)}, indent=2)}
 
 Previous response:
 {json.dumps(parsed, indent=2)}
@@ -418,11 +448,13 @@ complete and return only valid JSON in the same structure.
 
 def validate_with_groq(
     task: TaskInput,
+    project: str | None = None,
+    sprint: str | None = None,
 ) -> ValidationResult:
     try:
         parsed = request_groq_validation(
             task,
-            build_prompt(task),
+            build_prompt(task, project, sprint),
         )
         parsed = normalize_validation_result(task, parsed)
 
@@ -443,7 +475,12 @@ def validate_with_groq(
         ):
             parsed = request_groq_validation(
                 task,
-                build_estimate_correction_prompt(task, parsed),
+                build_estimate_correction_prompt(
+                    task,
+                    parsed,
+                    project,
+                    sprint,
+                ),
             )
             parsed = normalize_validation_result(task, parsed)
 
@@ -465,22 +502,75 @@ def validate_with_groq(
                     "but did not provide a revised estimate."
                 )
 
+        final_decision = parsed.get("decision", "").upper()
+        parsed["decision"] = final_decision
+
         non_estimate_change_decisions = {
             "PROCEED",
             "REWRITE_TASK",
             "CANNOT_VALIDATE_ESTIMATE",
         }
 
-        if decision in non_estimate_change_decisions:
+        if final_decision in non_estimate_change_decisions:
             parsed["suggested_estimated_hours"] = (
                 task.estimated_hours
             )
+
+        recommendation = clean_text(parsed.get("recommendation"))
+        disclaimer = (
+            "This is an AI-generated estimation review based only on "
+            "the supplied task information; human approval is required."
+        )
+        if disclaimer.lower() not in recommendation.lower():
+            recommendation = f"{recommendation} {disclaimer}".strip()
+        parsed["recommendation"] = recommendation
 
         return ValidationResult.model_validate(parsed)
 
     except Exception as error:
         return validation_error_result(task, error)
 
+
+
+def validate_tasks_concurrently(
+    tasks: list[TaskInput],
+    project: str | None = None,
+    sprint: str | None = None,
+) -> list[ValidationResult]:
+    """Validate tasks concurrently while preserving the input order."""
+    if not tasks:
+        return []
+
+    worker_count = min(BULK_MAX_WORKERS, len(tasks))
+    ordered_results: list[ValidationResult | None] = [None] * len(tasks)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_index = {
+            executor.submit(
+                validate_with_groq,
+                task,
+                project,
+                sprint,
+            ): index
+            for index, task in enumerate(tasks)
+        }
+
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            task = tasks[index]
+            try:
+                ordered_results[index] = future.result()
+            except Exception as error:
+                ordered_results[index] = validation_error_result(
+                    task,
+                    error,
+                )
+
+    return [
+        result
+        for result in ordered_results
+        if result is not None
+    ]
 
 def dataframe_to_tasks(
     dataframe: pd.DataFrame,
@@ -606,10 +696,11 @@ def validate_backlog_json(
             detail="At least one task is required.",
         )
 
-    results = [
-        validate_with_groq(task)
-        for task in request.tasks
-    ]
+    results = validate_tasks_concurrently(
+        request.tasks,
+        project=request.project,
+        sprint=request.sprint,
+    )
 
     return build_bulk_response(results)
 
@@ -650,10 +741,7 @@ async def upload_and_validate(
                 detail="No valid tasks found in workbook",
             )
 
-        results = [
-            validate_with_groq(task)
-            for task in tasks
-        ]
+        results = validate_tasks_concurrently(tasks)
 
         return build_bulk_response(results)
 
