@@ -18,6 +18,8 @@ calculations are performed locally in Python (never by the LLM).
 import json
 import logging
 import os
+import random
+import threading
 import time
 from datetime import date
 from enum import Enum
@@ -33,6 +35,7 @@ from groq import (
     APITimeoutError,
     AuthenticationError,
     Groq,
+    RateLimitError,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -67,10 +70,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent2")
 
-MAX_LLM_RETRIES = 3
-GROQ_REQUEST_TIMEOUT_SECONDS = 60
-LLM_TEMPERATURE = 0.1
-RETRY_BACKOFF_SECONDS = 1.5
+MAX_LLM_RETRIES = int(os.getenv("MAX_LLM_RETRIES", "3"))
+GROQ_REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv("GROQ_REQUEST_TIMEOUT_SECONDS", "60")
+)
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
+GROQ_MAX_COMPLETION_TOKENS = int(
+    os.getenv("GROQ_MAX_COMPLETION_TOKENS", "1800")
+)
+
+# Client-side ceiling on concurrent Groq calls from this service. Each
+# review is a single Groq call, but under concurrent manager traffic this
+# is what keeps a burst of simultaneous reviews from tripping the
+# account's free-tier RPM (requests-per-minute) limit.
+GROQ_MAX_CONCURRENT_REQUESTS = max(
+    1,
+    int(os.getenv("GROQ_MAX_CONCURRENT_REQUESTS", "3")),
+)
+
+# Long free-text fields cost tokens without adding review value beyond a
+# point; truncating keeps one oversized entry from eating a
+# disproportionate share of the per-minute token budget.
+MAX_TEXT_FIELD_CHARS = int(os.getenv("MAX_TEXT_FIELD_CHARS", "2000"))
+
+_groq_concurrency_gate = threading.Semaphore(GROQ_MAX_CONCURRENT_REQUESTS)
 
 # Fields the LLM must never emit. The Agent only ever issues a
 # recommendation - the Project Manager makes the actual approval decision -
@@ -306,6 +330,23 @@ def calculate_effort_summary(
 
 
 # ==============================================================
+# 8b. PROMPT-SIZE GUARD
+# ==============================================================
+
+
+def truncate_for_prompt(text: str, max_chars: int = MAX_TEXT_FIELD_CHARS) -> str:
+    """Cap long free-text fields before they go into a Groq prompt.
+
+    Only affects what is sent to the model - the values stored and
+    returned in the response are always the untouched originals.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+
+    return text[:max_chars].rstrip() + " …[truncated for length]"
+
+
+# ==============================================================
 # 9. PROMPT BUILDER
 # ==============================================================
 
@@ -324,7 +365,9 @@ def build_prompt(request: TimesheetReviewRequest, effort_summary: EffortSummary)
                 "entry_id": entry.entry_id,
                 "date": entry.date.isoformat(),
                 "discipline": entry.discipline,
-                "activity_description": entry.activity_description,
+                "activity_description": truncate_for_prompt(
+                    entry.activity_description
+                ),
                 "planned_hours": entry.planned_hours,
                 "actual_hours": entry.actual_hours,
             }
@@ -334,6 +377,9 @@ def build_prompt(request: TimesheetReviewRequest, effort_summary: EffortSummary)
     )
 
     backlog_task = request.backlog_task
+    prompt_task_description = truncate_for_prompt(
+        backlog_task.task_description
+    )
 
     prompt = f"""You are an expert Project Management Assistant AI. Your job is to
 review an employee's timesheet entries against ONE approved backlog task and
@@ -367,7 +413,7 @@ Sprint: {backlog_task.sprint}
 Module: {backlog_task.module}
 Feature: {backlog_task.feature}
 Task Title: {backlog_task.task_title}
-Task Description: {backlog_task.task_description}
+Task Description: {prompt_task_description}
 Task Type: {backlog_task.task_type or "N/A"}
 Complexity: {backlog_task.complexity}
 Task Status: {backlog_task.task_status}
@@ -490,6 +536,11 @@ class GroqAuthenticationFailure(Exception):
     """The Groq API rejected our credentials. Never retryable."""
 
 
+class GroqRateLimitFailure(Exception):
+    """HTTP 429 - retryable, but should back off longer than a generic
+    transient failure since it means the per-minute budget is exhausted."""
+
+
 class GroqTransientFailure(Exception):
     """Timeout, connection, or 5xx error from Groq. Safe to retry."""
 
@@ -498,54 +549,89 @@ class GroqPermanentFailure(Exception):
     """Any other non-retryable Groq API error (e.g. a 4xx bad request)."""
 
 
+def _is_json_validate_failed(exc: APIStatusError) -> bool:
+    """True if Groq's response body reports code == "json_validate_failed".
+
+    This is a 400 from Groq's JSON-mode validator when the model's
+    generated text failed to parse as JSON. It is a sampling hiccup, not
+    a malformed request - the same prompt commonly succeeds on retry -
+    so it is treated as transient rather than permanent, unlike other
+    4xx errors.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        code = body.get("code") or body.get("error", {}).get("code")
+        if code == "json_validate_failed":
+            return True
+    return "json_validate_failed" in str(exc)
+
+
 groq_client = Groq(api_key=GROQ_API_KEY, timeout=GROQ_REQUEST_TIMEOUT_SECONDS)
 
 
 def call_groq_llm(prompt: str) -> str:
     """Call the Groq chat completion API and return the raw text response.
 
+    Bounded by GROQ_MAX_CONCURRENT_REQUESTS so a burst of simultaneous
+    reviews never has more requests in flight against Groq than the
+    account's free-tier RPM budget can absorb.
+
     Raises:
         GroqAuthenticationFailure: invalid/missing credentials.
+        GroqRateLimitFailure: HTTP 429 - caller should back off and retry.
         GroqTransientFailure: timeout, connection, or 5xx error - the
             caller may safely retry.
         GroqPermanentFailure: any other non-retryable API error.
     """
-    try:
-        completion = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a precise reasoning engine that returns "
-                        "only valid JSON with no additional text."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=LLM_TEMPERATURE,
-            response_format={"type": "json_object"},
-        )
-        return completion.choices[0].message.content or ""
+    with _groq_concurrency_gate:
+        try:
+            completion = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a precise reasoning engine that returns "
+                            "only valid JSON with no additional text."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=LLM_TEMPERATURE,
+                max_completion_tokens=GROQ_MAX_COMPLETION_TOKENS,
+                response_format={"type": "json_object"},
+            )
+            return completion.choices[0].message.content or ""
 
-    except AuthenticationError as exc:
-        logger.error("Groq authentication error: %s", exc)
-        raise GroqAuthenticationFailure(str(exc)) from exc
+        except AuthenticationError as exc:
+            logger.error("Groq authentication error: %s", exc)
+            raise GroqAuthenticationFailure(str(exc)) from exc
 
-    except APITimeoutError as exc:
-        logger.warning("Groq request timed out: %s", exc)
-        raise GroqTransientFailure(str(exc)) from exc
+        except RateLimitError as exc:
+            logger.warning("Groq rate limit (429) hit: %s", exc)
+            raise GroqRateLimitFailure(str(exc)) from exc
 
-    except APIConnectionError as exc:
-        logger.warning("Groq connection error: %s", exc)
-        raise GroqTransientFailure(str(exc)) from exc
-
-    except APIStatusError as exc:
-        if exc.status_code >= 500:
-            logger.warning("Groq API returned a server error: %s", exc)
+        except APITimeoutError as exc:
+            logger.warning("Groq request timed out: %s", exc)
             raise GroqTransientFailure(str(exc)) from exc
-        logger.error("Groq API returned a client error: %s", exc)
-        raise GroqPermanentFailure(str(exc)) from exc
+
+        except APIConnectionError as exc:
+            logger.warning("Groq connection error: %s", exc)
+            raise GroqTransientFailure(str(exc)) from exc
+
+        except APIStatusError as exc:
+            if exc.status_code >= 500:
+                logger.warning("Groq API returned a server error: %s", exc)
+                raise GroqTransientFailure(str(exc)) from exc
+            if exc.status_code == 400 and _is_json_validate_failed(exc):
+                logger.warning(
+                    "Groq JSON validation failed (400 json_validate_failed), "
+                    "treating as retryable: %s",
+                    exc,
+                )
+                raise GroqTransientFailure(str(exc)) from exc
+            logger.error("Groq API returned a client error: %s", exc)
+            raise GroqPermanentFailure(str(exc)) from exc
 
 
 # ==============================================================
@@ -619,6 +705,24 @@ def get_llm_review(prompt: str) -> LLMReviewResult:
                 status_code=502,
                 detail=f"The Groq API returned a non-retryable error: {exc}",
             ) from exc
+
+        except GroqRateLimitFailure as exc:
+            last_error = exc
+            # Rate limits get a longer, exponentially growing wait than
+            # other transient errors, since retrying immediately just
+            # burns the retry budget against a still-full quota.
+            wait_seconds = (
+                RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                + random.uniform(0, 0.5)
+            )
+            logger.warning(
+                "Rate limited (attempt %d/%d); backing off %.1fs",
+                attempt,
+                MAX_LLM_RETRIES,
+                wait_seconds,
+            )
+            if attempt < MAX_LLM_RETRIES:
+                time.sleep(wait_seconds)
 
         except (GroqTransientFailure, json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
