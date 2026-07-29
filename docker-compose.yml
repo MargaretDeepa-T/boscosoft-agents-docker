@@ -7,6 +7,11 @@ services:
     restart: unless-stopped
     env_file:
       - ./agent1/.env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     ports:
       - "8001:8000"
     networks:
@@ -23,6 +28,21 @@ services:
     networks:
       - agents-net
 
+  redis:
+    image: redis:7-alpine
+    container_name: boscosoft-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agents-net
+
 #  nginx:
 #    image: nginx:1.27-alpine
 #    container_name: boscosoft-gateway
@@ -36,6 +56,9 @@ services:
 #      - agent2
 #    networks:
 #      - agents-net
+
+volumes:
+  redis-data:
 
 networks:
   agents-net:

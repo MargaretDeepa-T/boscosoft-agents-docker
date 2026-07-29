@@ -55,7 +55,6 @@ Both should return a JSON status.
 **Agent 1 — Task Validation**
 - `POST /agent1/api/v1/task/validate`
 - `POST /agent1/api/v1/backlog/validate`
-- `POST /agent1/api/v1/backlog/upload-and-validate` (Excel upload)
 
 **Agent 2 — Timesheet Review**
 - `POST /agent2/api/v1/manager/timesheet-review`
