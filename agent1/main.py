@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -388,8 +389,8 @@ Immediately return decision = CANNOT_VALIDATE_ESTIMATE with the following field 
 - "effort_assessment": state that the estimate cannot be validated without a valid description.
 - "suggested_task_title": return the original title unchanged. Do not invent a new title.
 - "suggested_task_description": return the original description unchanged (or an empty-input placeholder such as "No description provided" if the original was truly empty/whitespace/null). Do not invent content.
-- "suggested_estimated_hours": return 0. This is a reserved sentinel value meaning "not applicable / not validated," and must NOT be read as an approved or recommended estimate. Do not return the original estimated_hours value here, since doing so could be misread as confirming the original estimate is acceptable.
-- "recommendation": explicitly state that the estimate could not be validated because the description is missing or insufficient, and that the user must provide a meaningful task description before re-validation.
+- "suggested_estimated_hours": return the ORIGINAL estimated_hours value unchanged. This does NOT mean the estimate is approved or validated - it only means no alternative number can be produced without a meaningful description. The recommendation field (and the system's own message) will make clear that the estimate is UNVALIDATED, not confirmed.
+- "recommendation": explicitly state that the estimate could not be validated because the description is missing or insufficient, that the originally submitted estimated hours are being carried forward unchanged only because no alternative can be computed, and that the user must provide a meaningful task description before re-validation.
 
 Do NOT estimate effort.
 
@@ -597,7 +598,7 @@ CANNOT_VALIDATE_ESTIMATE
 
 Return
 
-suggested_estimated_hours = 0 (reserved sentinel meaning "not validated" — see MANDATORY TASK DESCRIPTION section)
+suggested_estimated_hours = original estimated_hours, unchanged (this is NOT an approval of the estimate - it is carried forward only because no alternative can be computed without a valid description; see MANDATORY TASK DESCRIPTION section)
 
 ====================================================================
 ASSESSMENT RULES
@@ -681,7 +682,7 @@ Everything changed
 
 Description insufficient (CANNOT_VALIDATE_ESTIMATE)
 
-"The estimate could not be validated because the task description is missing or insufficient. Please provide a meaningful description and resubmit for validation."
+"The estimate could not be validated because the task description is missing or insufficient. The originally submitted estimate is carried forward unchanged, not approved. Please provide a meaningful description and resubmit for validation."
 
 The recommendation MUST always agree with the assessment fields and with the decision value.
 
@@ -763,7 +764,7 @@ A meaningful task description is mandatory.
 
 Without a meaningful task description,
 
-always return decision = CANNOT_VALIDATE_ESTIMATE with suggested_estimated_hours = 0, per the MANDATORY TASK DESCRIPTION section.
+always return decision = CANNOT_VALIDATE_ESTIMATE with suggested_estimated_hours = the original estimated_hours value, unchanged, per the MANDATORY TASK DESCRIPTION section.
 
 Human review is always required before applying AI recommendations.
 
@@ -1018,6 +1019,69 @@ def normalize_validation_result(
     return parsed
 
 
+def build_suggestion_summary(
+    task: TaskInput,
+    parsed: dict[str, Any],
+) -> str:
+    """Deterministically state every suggested change.
+
+    Requirement: "All suggested information must also be in the
+    Recommendation." The system prompt asks the model to summarize its
+    own suggestions, but that is not guaranteed - the model can drift,
+    be vague, or omit a field. This function is a code-level guarantee:
+    it inspects the actual suggested_task_title, suggested_task_description
+    and suggested_estimated_hours values and appends a factual, literal
+    statement of each one that differs from the original, so the
+    recommendation always reflects the real suggested values regardless
+    of what the model wrote.
+    """
+    decision = parsed.get("decision", "")
+
+    if decision == "CANNOT_VALIDATE_ESTIMATE":
+        return (
+            "No suggested changes are available: the estimate could not "
+            "be validated, so the original title, description, and "
+            "estimated hours are carried forward unchanged (not approved)."
+        )
+
+    parts: list[str] = []
+
+    suggested_title = clean_text(
+        parsed.get("suggested_task_title", task.task_title)
+    )
+    if suggested_title != clean_text(task.task_title):
+        parts.append(f'Suggested task title: "{suggested_title}".')
+
+    suggested_description = clean_text(
+        parsed.get("suggested_task_description", task.task_description)
+    )
+    if suggested_description != clean_text(task.task_description):
+        parts.append(
+            f'Suggested task description: "{suggested_description}".'
+        )
+
+    try:
+        suggested_hours = float(
+            parsed.get("suggested_estimated_hours", task.estimated_hours)
+        )
+    except (TypeError, ValueError):
+        suggested_hours = task.estimated_hours
+
+    if not hours_are_equal(suggested_hours, task.estimated_hours):
+        parts.append(
+            f"Suggested estimated hours: {suggested_hours} "
+            f"(originally {task.estimated_hours})."
+        )
+
+    if not parts:
+        return (
+            "No changes suggested: the original title, description, and "
+            "estimated hours all appear reasonable and remain unchanged."
+        )
+
+    return " ".join(parts)
+
+
 def validation_error_result(
     task: TaskInput,
     error: Exception,
@@ -1044,6 +1108,432 @@ def hours_are_equal(
     tolerance: float = 0.01,
 ) -> bool:
     return abs(first - second) <= tolerance
+
+
+# ==============================================================
+# VALIDATION RESULT CACHE
+# ==============================================================
+# Requirement: re-validating the same task, unchanged, must ALWAYS
+# produce the same suggested estimate - not "usually", not "until the
+# process restarts". These estimates get assigned to developers and
+# shown to clients, so they must be exact and stable.
+#
+# temperature=0 and the prompt's CONSISTENCY section make the model
+# *likely* to be consistent, but hosted LLM sampling does not strictly
+# guarantee identical output across separate calls. So instead of
+# hoping the model agrees with itself, every result is cached by a
+# fingerprint of the task's content: an unchanged task never calls the
+# LLM twice and therefore cannot get a different answer. Any real
+# change to any field (title, description, hours, complexity, module,
+# feature, project tag) yields a different fingerprint and correctly
+# triggers fresh validation.
+#
+# Persistence: this cache is backed by Redis (REDIS_URL) when it's
+# configured and reachable, so a result survives container restarts
+# and is shared across every replica/worker of this service - a
+# result computed on one instance is reused by all the others instead
+# of each one silently deciding for itself. If Redis is not configured
+# or is temporarily unreachable, the service "fails open": it falls
+# back to a process-local in-memory cache rather than refusing to
+# validate. That local fallback is only exact within a single running
+# process - point Redis at a real, reachable instance (docker-compose
+# already provisions one) whenever more than one instance/worker of
+# this service is running, or whenever restarts must not reset it.
+#
+# VALIDATION_CACHE_TTL_SECONDS controls storage retention only, not
+# correctness: 0 (default) means cached results never expire on their
+# own. Freshness is never time-based - a task is only ever re-evaluated
+# because something in it actually changed (a different fingerprint),
+# never because a clock ran out.
+
+CACHE_KEY_PREFIX = "agent1:validation:"
+
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+VALIDATION_CACHE_TTL_SECONDS = int(
+    os.getenv("VALIDATION_CACHE_TTL_SECONDS", "0")
+)
+
+try:
+    import redis as _redis_module
+except ImportError:
+    _redis_module = None
+    logger.warning(
+        "The 'redis' package is not installed; the validation cache "
+        "will be in-memory only for this process (see requirements.txt)."
+    )
+
+_redis_client = None
+if REDIS_URL and _redis_module is not None:
+    try:
+        _redis_client = _redis_module.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        _redis_client.ping()
+        logger.info(
+            "Validation cache backed by Redis at %s - results persist "
+            "across restarts and are shared across replicas.",
+            REDIS_URL,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Redis at %s is unreachable (%s); failing open to an "
+            "in-memory-only validation cache for this process. Cached "
+            "results will NOT survive a restart or be shared across "
+            "other instances until Redis is reachable.",
+            REDIS_URL,
+            exc,
+        )
+        _redis_client = None
+elif not REDIS_URL:
+    logger.info(
+        "REDIS_URL is not set; the validation cache is in-memory only "
+        "for this process. Set REDIS_URL (docker-compose already "
+        "provides one) so results persist across restarts and are "
+        "shared across replicas."
+    )
+
+# Always-present fallback layer, used when Redis is absent/unreachable
+# and as a fast local mirror when Redis IS present.
+_validation_cache: dict[str, ValidationResult] = {}
+_validation_cache_lock = threading.Lock()
+
+
+def compute_task_fingerprint(
+    task: TaskInput,
+    project: str | None = None,
+    sprint: str | None = None,
+) -> str:
+    """Stable fingerprint of everything that can influence validation."""
+    payload = {
+        "task_id": task.task_id,
+        "module_name": clean_text(task.module_name),
+        "feature_name": clean_text(task.feature_name),
+        "task_title": clean_text(task.task_title),
+        "task_description": clean_text(task.task_description),
+        "estimated_hours": round(task.estimated_hours, 2),
+        "complexity": clean_text(task.complexity).lower(),
+        "project_tag": clean_text(task.project_tag),
+        "project": clean_text(project),
+        "sprint": clean_text(sprint),
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def get_cached_result(fingerprint: str) -> ValidationResult | None:
+    if _redis_client is not None:
+        try:
+            raw = _redis_client.get(CACHE_KEY_PREFIX + fingerprint)
+            if raw is not None:
+                return ValidationResult.model_validate_json(raw)
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Redis GET failed (%s); falling back to the in-memory "
+                "cache for this lookup.",
+                exc,
+            )
+
+    with _validation_cache_lock:
+        cached = _validation_cache.get(fingerprint)
+    return cached.model_copy() if cached is not None else None
+
+
+def store_cached_result(
+    fingerprint: str,
+    result: ValidationResult,
+) -> None:
+    # Never cache ERROR results: a transient failure (timeout, rate
+    # limit exhaustion, malformed model output, etc.) should not
+    # permanently "stick" - the next validation attempt for the same
+    # task should be free to try the LLM again.
+    if result.decision == "ERROR":
+        return
+
+    if _redis_client is not None:
+        try:
+            payload = result.model_dump_json()
+            key = CACHE_KEY_PREFIX + fingerprint
+            if VALIDATION_CACHE_TTL_SECONDS > 0:
+                _redis_client.set(
+                    key, payload, ex=VALIDATION_CACHE_TTL_SECONDS
+                )
+            else:
+                _redis_client.set(key, payload)
+        except Exception as exc:
+            logger.warning(
+                "Redis SET failed (%s); this result is only cached "
+                "in-memory on this process for now.",
+                exc,
+            )
+
+    # Always keep a local copy too: it's what serves reads if Redis is
+    # momentarily unreachable, and it's the only copy at all when
+    # Redis isn't configured.
+    with _validation_cache_lock:
+        _validation_cache[fingerprint] = result.model_copy()
+
+
+def clear_validation_cache() -> None:
+    if _redis_client is not None:
+        try:
+            for prefix in (CACHE_KEY_PREFIX, CANONICAL_KEY_PREFIX):
+                cursor = 0
+                while True:
+                    cursor, keys = _redis_client.scan(
+                        cursor=cursor,
+                        match=prefix + "*",
+                        count=500,
+                    )
+                    if keys:
+                        _redis_client.delete(*keys)
+                    if cursor == 0:
+                        break
+        except Exception as exc:
+            logger.warning(
+                "Redis cache clear failed (%s); in-memory cache was "
+                "still cleared.",
+                exc,
+            )
+
+    with _validation_cache_lock:
+        _validation_cache.clear()
+        _canonical_cache.clear()
+
+
+# ==============================================================
+# CANONICAL ESTIMATE
+# ==============================================================
+# The exact-fingerprint cache above only guarantees that literally
+# resubmitting the SAME estimated_hours for the SAME task returns the
+# SAME answer. It does NOT stop the LLM from picking a DIFFERENT
+# "correct" number each time it's asked to judge a DIFFERENT
+# estimated_hours against the same task - e.g. submitting 8h might get
+# corrected to "48h is realistic", and later submitting 40h for the
+# exact same task/description might get corrected to "50h is
+# realistic" instead of also landing on 48h. Both individual answers
+# can look plausible to the model in isolation, but together they
+# contradict each other - the task's real effort cannot simultaneously
+# be 48h and 50h when nothing about the task itself changed.
+#
+# These estimates are assigned to developers and shown to clients, so
+# they must be exact and stable - not "the model's best guess this
+# particular time". So: the FIRST time a task's content (title,
+# description, scope, complexity - everything EXCEPT the estimated
+# hours being tested) is ever validated, whatever number the model
+# lands on for "what this task should realistically take" is PINNED as
+# that task's one canonical estimate. Every later validation of the
+# same content - no matter what estimated_hours is submitted, and no
+# matter how many times - reuses that same pinned number. No further
+# LLM call is made for those checks at all: the decision becomes a
+# plain, deterministic comparison in code between the submitted hours
+# and the pinned canonical hours. That is what actually guarantees
+# exactness, rather than hoping the model agrees with itself.
+#
+# The canonical estimate is only ever replaced when the task's own
+# content changes (a different content fingerprint) - never because a
+# different number was tested against it.
+
+CANONICAL_KEY_PREFIX = "agent1:canonical:"
+
+# How close a submitted estimate must be to the canonical estimate to
+# be accepted without being flagged. Accepts the LARGER of a flat hour
+# allowance and a percentage of the canonical estimate, so small tasks
+# keep a sane minimum cushion and large tasks scale sensibly. Tune via
+# env if your organization's tolerance for "close enough" differs.
+ESTIMATE_TOLERANCE_ABS_HOURS = float(
+    os.getenv("ESTIMATE_TOLERANCE_ABS_HOURS", "2")
+)
+ESTIMATE_TOLERANCE_PCT = float(
+    os.getenv("ESTIMATE_TOLERANCE_PCT", "0.20")
+)
+
+_canonical_cache: dict[str, dict[str, Any]] = {}
+
+
+def compute_content_fingerprint(
+    task: TaskInput,
+    project: str | None = None,
+    sprint: str | None = None,
+) -> str:
+    """Fingerprint of everything EXCEPT estimated_hours.
+
+    Identifies "the same task" for pinning a canonical estimate: two
+    validations with the same title/description/scope/complexity are
+    the same task even when a different estimated_hours is being
+    tested against it.
+    """
+    payload = {
+        "task_id": task.task_id,
+        "module_name": clean_text(task.module_name),
+        "feature_name": clean_text(task.feature_name),
+        "task_title": clean_text(task.task_title),
+        "task_description": clean_text(task.task_description),
+        "complexity": clean_text(task.complexity).lower(),
+        "project_tag": clean_text(task.project_tag),
+        "project": clean_text(project),
+        "sprint": clean_text(sprint),
+    }
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def estimate_tolerance(canonical_hours: float) -> float:
+    return max(
+        ESTIMATE_TOLERANCE_ABS_HOURS,
+        ESTIMATE_TOLERANCE_PCT * canonical_hours,
+    )
+
+
+def get_canonical_estimate(
+    content_fingerprint: str,
+) -> dict[str, Any] | None:
+    key = CANONICAL_KEY_PREFIX + content_fingerprint
+    if _redis_client is not None:
+        try:
+            raw = _redis_client.get(key)
+            return json.loads(raw) if raw is not None else None
+        except Exception as exc:
+            logger.warning(
+                "Redis GET failed for canonical estimate (%s); "
+                "falling back to the in-memory copy for this lookup.",
+                exc,
+            )
+
+    with _validation_cache_lock:
+        canonical = _canonical_cache.get(content_fingerprint)
+    return dict(canonical) if canonical is not None else None
+
+
+def store_canonical_estimate(
+    content_fingerprint: str,
+    canonical: dict[str, Any],
+) -> None:
+    key = CANONICAL_KEY_PREFIX + content_fingerprint
+    if _redis_client is not None:
+        try:
+            payload = json.dumps(canonical)
+            if VALIDATION_CACHE_TTL_SECONDS > 0:
+                _redis_client.set(
+                    key, payload, ex=VALIDATION_CACHE_TTL_SECONDS
+                )
+            else:
+                _redis_client.set(key, payload)
+        except Exception as exc:
+            logger.warning(
+                "Redis SET failed for canonical estimate (%s); this "
+                "task's canonical estimate is only pinned in-memory on "
+                "this process for now.",
+                exc,
+            )
+
+    with _validation_cache_lock:
+        _canonical_cache[content_fingerprint] = dict(canonical)
+
+
+def build_result_from_canonical(
+    task: TaskInput,
+    canonical: dict[str, Any],
+) -> ValidationResult:
+    """Deterministically compare the submitted hours to the pinned
+    canonical estimate - no LLM call, so no room for a different
+    "right answer" to be invented this time around.
+    """
+    canonical_hours = float(canonical["canonical_hours"])
+    tolerance = estimate_tolerance(canonical_hours)
+    hours_ok = abs(task.estimated_hours - canonical_hours) <= tolerance
+
+    suggested_title = canonical.get(
+        "suggested_task_title", task.task_title
+    )
+    suggested_description = canonical.get(
+        "suggested_task_description", task.task_description
+    )
+    needs_rewrite = (
+        clean_text(suggested_title) != clean_text(task.task_title)
+        or clean_text(suggested_description)
+        != clean_text(task.task_description)
+    )
+
+    if needs_rewrite and not hours_ok:
+        decision = "REWRITE_AND_REESTIMATE"
+    elif needs_rewrite and hours_ok:
+        decision = "REWRITE_TASK"
+    elif not hours_ok:
+        decision = "REVIEW_ESTIMATE"
+    else:
+        decision = "PROCEED"
+
+    suggested_hours = task.estimated_hours if hours_ok else canonical_hours
+
+    if hours_ok:
+        effort_assessment = (
+            f"The submitted estimate ({task.estimated_hours}h) is "
+            f"consistent with the validated effort already established "
+            f"for this task ({canonical_hours}h); no change needed."
+        )
+        recommendation = (
+            "The task title, description, and scope were already "
+            "validated for this task and remain unchanged. The "
+            "submitted estimate is consistent with the previously "
+            "validated effort."
+        )
+    else:
+        effort_assessment = (
+            f"The submitted estimate ({task.estimated_hours}h) differs "
+            f"substantially from the effort previously validated for "
+            f"this task ({canonical_hours}h)."
+        )
+        recommendation = (
+            "The task title, description, and scope were already "
+            "validated for this task and remain unchanged. The "
+            "submitted estimate does not match the previously "
+            "validated effort and should be revised."
+        )
+
+    parsed: dict[str, Any] = {
+        "task_id": task.task_id,
+        "decision": decision,
+        "task_title_assessment": canonical.get(
+            "task_title_assessment",
+            "Not re-evaluated - title unchanged since it was last validated.",
+        ),
+        "task_description_assessment": canonical.get(
+            "task_description_assessment",
+            "Not re-evaluated - description unchanged since it was last validated.",
+        ),
+        "scope_assessment": canonical.get(
+            "scope_assessment",
+            "Not re-evaluated - scope unchanged since it was last validated.",
+        ),
+        "effort_assessment": effort_assessment,
+        "suggested_task_title": suggested_title,
+        "suggested_task_description": suggested_description,
+        "suggested_estimated_hours": suggested_hours,
+        "confidence_score": canonical.get("confidence_score", 0.8),
+        "recommendation": recommendation,
+    }
+
+    suggestion_summary = build_suggestion_summary(task, parsed)
+    if (
+        suggestion_summary
+        and suggestion_summary.lower() not in recommendation.lower()
+    ):
+        recommendation = f"{recommendation} {suggestion_summary}".strip()
+
+    disclaimer = (
+        "This is an AI-generated estimation review based only on "
+        "the supplied task information; human review is required before applying any changes."
+    )
+    if disclaimer.lower() not in recommendation.lower():
+        recommendation = f"{recommendation} {disclaimer}".strip()
+
+    parsed["recommendation"] = recommendation
+
+    return ValidationResult.model_validate(parsed)
 
 
 # ==============================================================
@@ -1263,6 +1753,40 @@ def validate_with_groq(
     project: str | None = None,
     sprint: str | None = None,
 ) -> ValidationResult:
+    fingerprint = compute_task_fingerprint(task, project, sprint)
+
+    cached = get_cached_result(fingerprint)
+    if cached is not None:
+        logger.info(
+            "Task %s unchanged since last validation; returning the "
+            "same cached result instead of calling the LLM again.",
+            task.task_id,
+        )
+        # task_id is echoed from the current request even on a cache
+        # hit, in case the same content was previously validated under
+        # a different task_id.
+        return cached.model_copy(update={"task_id": task.task_id})
+
+    # A different estimated_hours than last time means a cache miss
+    # above, but that does NOT mean a different "right answer" should
+    # be invented. If this task's content has already produced a
+    # pinned canonical estimate, compare against that instead of
+    # asking the LLM to judge a fresh target - see CANONICAL ESTIMATE.
+    content_fingerprint = compute_content_fingerprint(task, project, sprint)
+    canonical = get_canonical_estimate(content_fingerprint)
+
+    if canonical is not None:
+        logger.info(
+            "Task %s: reusing the previously pinned canonical estimate "
+            "(%sh) for this task instead of asking the LLM to judge a "
+            "new target.",
+            task.task_id,
+            canonical.get("canonical_hours"),
+        )
+        result = build_result_from_canonical(task, canonical)
+        store_cached_result(fingerprint, result)
+        return result
+
     try:
         parsed = request_groq_validation(
             task,
@@ -1329,6 +1853,15 @@ def validate_with_groq(
             )
 
         recommendation = clean_text(parsed.get("recommendation"))
+
+        # Requirement: every suggested change must appear in the
+        # recommendation. Built from the actual field values rather than
+        # trusted from the model, so this is guaranteed rather than
+        # merely requested via the prompt.
+        suggestion_summary = build_suggestion_summary(task, parsed)
+        if suggestion_summary and suggestion_summary.lower() not in recommendation.lower():
+            recommendation = f"{recommendation} {suggestion_summary}".strip()
+
         disclaimer = (
             "This is an AI-generated estimation review based only on "
             "the supplied task information; human review is required before applying any changes."
@@ -1337,7 +1870,35 @@ def validate_with_groq(
             recommendation = f"{recommendation} {disclaimer}".strip()
         parsed["recommendation"] = recommendation
 
-        return ValidationResult.model_validate(parsed)
+        result = ValidationResult.model_validate(parsed)
+
+        # Pin this task's content to the estimate the model just
+        # produced, so every future check - regardless of what
+        # estimated_hours gets tested against it - compares against
+        # this same number instead of letting the LLM invent a new
+        # one. Skipped for CANNOT_VALIDATE_ESTIMATE: there is no real
+        # target to pin without a valid description.
+        if result.decision != "CANNOT_VALIDATE_ESTIMATE":
+            canonical_hours = (
+                task.estimated_hours
+                if result.decision in {"PROCEED", "REWRITE_TASK"}
+                else result.suggested_estimated_hours
+            )
+            store_canonical_estimate(
+                content_fingerprint,
+                {
+                    "canonical_hours": canonical_hours,
+                    "task_title_assessment": result.task_title_assessment,
+                    "task_description_assessment": result.task_description_assessment,
+                    "scope_assessment": result.scope_assessment,
+                    "suggested_task_title": result.suggested_task_title,
+                    "suggested_task_description": result.suggested_task_description,
+                    "confidence_score": result.confidence_score,
+                },
+            )
+
+        store_cached_result(fingerprint, result)
+        return result
 
     except GroqAuthenticationFailure as error:
         # The API key itself is bad - this isn't a per-task problem, so
@@ -1494,6 +2055,114 @@ def health() -> dict[str, str]:
         "status": "ok",
         "model": GROQ_MODEL,
     }
+
+
+@app.get("/health/live")
+def health_live() -> dict[str, str]:
+    """Liveness probe: is the process itself up and serving requests.
+
+    Deliberately does not check downstream dependencies (Groq, Redis) -
+    that's what /health/ready is for. The Dockerfile's HEALTHCHECK
+    polls this exact path; it previously had nothing to hit here,
+    which meant every container was reported unhealthy on a 30s cycle
+    regardless of whether anything was actually wrong.
+    """
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready() -> dict[str, Any]:
+    """Readiness probe: is this instance ready to serve real traffic."""
+    redis_status = "not_configured"
+    if REDIS_URL:
+        try:
+            if _redis_client is not None:
+                _redis_client.ping()
+                redis_status = "connected"
+            else:
+                redis_status = "unreachable"
+        except Exception:
+            redis_status = "unreachable"
+
+    groq_configured = bool(GROQ_API_KEY)
+
+    return {
+        "status": "ready" if groq_configured else "not_ready",
+        "groq_configured": groq_configured,
+        "model": GROQ_MODEL,
+        "redis": redis_status,
+        "note": (
+            "redis='unreachable' or 'not_configured' does not block "
+            "readiness - the service fails open to an in-memory-only "
+            "validation cache, but consistency then only holds within "
+            "a single process. See REDIS_URL in .env."
+        ),
+    }
+
+
+@app.get("/api/v1/cache/stats")
+def cache_stats() -> dict[str, Any]:
+    with _validation_cache_lock:
+        local_size = len(_validation_cache)
+        local_canonical_size = len(_canonical_cache)
+
+    redis_backed = False
+    redis_size: int | None = None
+    redis_canonical_size: int | None = None
+    if _redis_client is not None:
+        try:
+            redis_backed = True
+            redis_size = 0
+            cursor = 0
+            while True:
+                cursor, keys = _redis_client.scan(
+                    cursor=cursor,
+                    match=CACHE_KEY_PREFIX + "*",
+                    count=500,
+                )
+                redis_size += len(keys)
+                if cursor == 0:
+                    break
+
+            redis_canonical_size = 0
+            cursor = 0
+            while True:
+                cursor, keys = _redis_client.scan(
+                    cursor=cursor,
+                    match=CANONICAL_KEY_PREFIX + "*",
+                    count=500,
+                )
+                redis_canonical_size += len(keys)
+                if cursor == 0:
+                    break
+        except Exception as exc:
+            logger.warning("Redis SCAN failed for cache_stats: %s", exc)
+            redis_backed = False
+            redis_size = None
+            redis_canonical_size = None
+
+    return {
+        "redis_backed": redis_backed,
+        "redis_cached_results": redis_size,
+        "in_memory_cached_results": local_size,
+        "redis_canonical_estimates": redis_canonical_size,
+        "in_memory_canonical_estimates": local_canonical_size,
+    }
+
+
+@app.post("/api/v1/cache/clear")
+def cache_clear() -> dict[str, str]:
+    """Force every task to be re-validated from scratch on its next call.
+
+    Not needed for normal operation - an unchanged task is always
+    consistent by design, in both the Redis-backed and in-memory-only
+    cases. Provided for testing and for the rare case where a fresh
+    LLM opinion is deliberately wanted despite no field having changed.
+    Clears both the Redis-backed cache (if configured) and this
+    process's local in-memory copy.
+    """
+    clear_validation_cache()
+    return {"status": "cache cleared"}
 
 
 @app.post(
