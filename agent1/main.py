@@ -85,6 +85,7 @@ _groq_concurrency_gate = threading.Semaphore(GROQ_MAX_CONCURRENT_REQUESTS)
 app = FastAPI(
     title="Boscosoft Task Validation API",
     version="1.3.0",
+    root_path="/agent1",
 )
 
 
