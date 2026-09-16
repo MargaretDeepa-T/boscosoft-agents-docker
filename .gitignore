@@ -1,2 +1,22 @@
+# Secrets - never commit
 .env
 .env.*
+!.env.example
+**/.env
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local backups / test data
+*_old.py
+*.xlsx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

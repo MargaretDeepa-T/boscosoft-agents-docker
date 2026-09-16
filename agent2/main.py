@@ -15,15 +15,18 @@ calculations are performed locally in Python (never by the LLM).
 # 1. IMPORTS
 # ==============================================================
 
+import hashlib
 import json
 import logging
 import os
 import random
 import threading
 import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -93,6 +96,40 @@ GROQ_MAX_CONCURRENT_REQUESTS = max(
 # point; truncating keeps one oversized entry from eating a
 # disproportionate share of the per-minute token budget.
 MAX_TEXT_FIELD_CHARS = int(os.getenv("MAX_TEXT_FIELD_CHARS", "2000"))
+
+# Upper bound on how many backlog tasks may be submitted in a single bulk
+# review request. Keeps one request from creating unbounded server work.
+MAX_TASKS_PER_BULK_REQUEST = max(
+    1,
+    int(os.getenv("MAX_TASKS_PER_BULK_REQUEST", "20")),
+)
+
+# Upper bound on the number of tasks processed concurrently within one
+# bulk request. This is independent of, and layered on top of, the Groq
+# concurrency gate below - each worker thread still has to acquire that
+# gate before it can actually call Groq.
+BULK_MAX_WORKERS = max(
+    1,
+    int(os.getenv("BULK_MAX_WORKERS", "3")),
+)
+
+# In-memory cache of completed reviews, keyed on a hash of everything
+# that can affect the outcome (employee, backlog task, timesheet
+# entries, report period). The LLM is not perfectly deterministic even
+# at low temperature, so without this, re-submitting the exact same,
+# unchanged task could yield a different decision/wording each time.
+# With it, an identical resubmission returns the exact same result
+# without calling the LLM again.
+REVIEW_CACHE_ENABLED = os.getenv("REVIEW_CACHE_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+REVIEW_CACHE_TTL_SECONDS = int(os.getenv("REVIEW_CACHE_TTL_SECONDS", "86400"))
+REVIEW_CACHE_MAX_ENTRIES = max(
+    1,
+    int(os.getenv("REVIEW_CACHE_MAX_ENTRIES", "1000")),
+)
 
 _groq_concurrency_gate = threading.Semaphore(GROQ_MAX_CONCURRENT_REQUESTS)
 
@@ -214,6 +251,85 @@ class TimesheetReviewRequest(BaseModel):
         return self
 
 
+class TaskTimesheetGroup(BaseModel):
+    """One backlog task paired with the timesheet entries logged against it.
+
+    Used only inside a bulk review request - one employee may submit
+    several of these, one per assigned backlog task.
+    """
+
+    backlog_task: BacklogTask
+    timesheet_entries: List[TimesheetEntry]
+
+    @model_validator(mode="after")
+    def validate_task_group(self) -> "TaskTimesheetGroup":
+        """Every task in a bulk request must have at least one entry."""
+        if not self.timesheet_entries:
+            raise ValueError("timesheet_entries cannot be empty.")
+        return self
+
+
+class BulkTimesheetReviewRequest(BaseModel):
+    """Request payload for reviewing multiple backlog tasks for one employee.
+
+    Each task is validated completely independently of the others - the
+    grouping here only exists to describe the batch; it is never sent to
+    the LLM as a single combined prompt.
+    """
+
+    report_type: ReportType
+    start_date: date
+    end_date: date
+    employee: Employee
+    tasks: List[TaskTimesheetGroup]
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "BulkTimesheetReviewRequest":
+        """Validate the date range, task list size, and cross-task uniqueness."""
+        if self.end_date < self.start_date:
+            raise ValueError("end_date cannot be before start_date.")
+
+        if not self.tasks:
+            raise ValueError("tasks cannot be empty.")
+
+        if len(self.tasks) > MAX_TASKS_PER_BULK_REQUEST:
+            raise ValueError(
+                "Bulk request contains "
+                f"{len(self.tasks)} tasks, which exceeds the configured "
+                f"maximum of {MAX_TASKS_PER_BULK_REQUEST} "
+                "(MAX_TASKS_PER_BULK_REQUEST)."
+            )
+
+        seen_task_ids: set[str] = set()
+        seen_entry_ids: set[str] = set()
+
+        for task_group in self.tasks:
+            task_id = task_group.backlog_task.task_id
+            if task_id in seen_task_ids:
+                raise ValueError(
+                    f"Duplicate task_id found in bulk request: {task_id}"
+                )
+            seen_task_ids.add(task_id)
+
+            for entry in task_group.timesheet_entries:
+                if entry.entry_id in seen_entry_ids:
+                    raise ValueError(
+                        "Duplicate entry_id found across bulk request: "
+                        f"{entry.entry_id}"
+                    )
+                seen_entry_ids.add(entry.entry_id)
+
+                if entry.date < self.start_date or entry.date > self.end_date:
+                    raise ValueError(
+                        f"Timesheet entry {entry.entry_id} has date "
+                        f"{entry.date.isoformat()}, which falls outside the "
+                        f"review period {self.start_date.isoformat()} - "
+                        f"{self.end_date.isoformat()}."
+                    )
+
+        return self
+
+
 # ==============================================================
 # 7. RESPONSE MODELS
 # ==============================================================
@@ -287,6 +403,152 @@ class LLMReviewResult(BaseModel):
     strengths: List[str] = Field(default_factory=list)
     issues: List[str] = Field(default_factory=list)
     manager_actions: List[str] = Field(default_factory=list)
+
+
+class TaskReviewFailure(BaseModel):
+    """Safe, client-facing record of one task that failed review in a bulk request."""
+
+    task_id: str
+    error_type: str
+    error_message: str
+
+
+class BulkTimesheetReviewResponse(BaseModel):
+    """Final response schema returned by the bulk manager timesheet review API."""
+
+    status: str
+    employee_id: str
+    employee_name: str
+    report_type: ReportType
+    review_period: ReviewPeriod
+    total_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    accepted_tasks: int
+    review_tasks: int
+    correction_required_tasks: int
+    total_planned_hours: float
+    total_actual_hours: float
+    results: List[TimesheetReviewResponse]
+    failures: List[TaskReviewFailure]
+
+
+class TaskReviewError(Exception):
+    """A single task's review could not be completed.
+
+    Carries a safe, client-facing error_type/message pair (no credentials,
+    stack traces, or other internal detail) plus the HTTP status code the
+    single-task endpoint should surface if this bubbles up there. The full
+    technical detail is always logged separately, server-side only, at the
+    point this is raised.
+    """
+
+    def __init__(self, error_type: str, message: str, status_code: int = 502) -> None:
+        self.error_type = error_type
+        self.message = message
+        self.status_code = status_code
+        super().__init__(message)
+
+
+# ==============================================================
+# 7b. REVIEW CACHE
+# ==============================================================
+#
+# Purpose: the LLM is not perfectly deterministic even at low temperature,
+# so re-validating the exact same, unchanged task twice can otherwise
+# produce a different decision or differently-worded issues each time.
+# This cache makes repeat validation of an unchanged task idempotent -
+# the same input always returns the same previously-computed result,
+# without a new LLM call - while still letting a genuinely changed task
+# (different hours, different activity text, etc.) get a fresh review.
+
+
+class _ReviewCache:
+    """Thread-safe, bounded, TTL in-memory cache of completed task reviews.
+
+    Keyed on a canonical hash of everything that can affect the review
+    outcome. Bounded by REVIEW_CACHE_MAX_ENTRIES with simple LRU eviction,
+    and entries expire after REVIEW_CACHE_TTL_SECONDS so a cache is never
+    served indefinitely.
+
+    In-memory only: cache contents are per-process and are lost on
+    restart. For multi-instance deployments, back this with Redis instead
+    (same get/set/clear interface) so all instances share one cache.
+    """
+
+    def __init__(self, max_entries: int, ttl_seconds: int) -> None:
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
+        self._store: "OrderedDict[str, Tuple[float, TimesheetReviewResponse]]" = (
+            OrderedDict()
+        )
+
+    def get(self, key: str) -> Optional["TimesheetReviewResponse"]:
+        if self._ttl_seconds <= 0:
+            return None
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            cached_at, response = entry
+            if (time.time() - cached_at) > self._ttl_seconds:
+                del self._store[key]
+                return None
+            self._store.move_to_end(key)
+            return response
+
+    def set(self, key: str, response: "TimesheetReviewResponse") -> None:
+        with self._lock:
+            self._store[key] = (time.time(), response)
+            self._store.move_to_end(key)
+            while len(self._store) > self._max_entries:
+                self._store.popitem(last=False)
+
+    def clear(self) -> int:
+        """Remove all cached entries. Returns the number removed."""
+        with self._lock:
+            count = len(self._store)
+            self._store.clear()
+            return count
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "enabled": REVIEW_CACHE_ENABLED,
+                "entries": len(self._store),
+                "max_entries": self._max_entries,
+                "ttl_seconds": self._ttl_seconds,
+            }
+
+
+_review_cache = _ReviewCache(
+    max_entries=REVIEW_CACHE_MAX_ENTRIES, ttl_seconds=REVIEW_CACHE_TTL_SECONDS
+)
+
+
+def compute_review_cache_key(request: "TimesheetReviewRequest") -> str:
+    """Build a canonical, order-independent hash of everything that can
+    affect a task's review outcome.
+
+    Timesheet entries are sorted by entry_id before hashing so that the
+    same set of entries in a different order still produces the same key.
+    Using model_dump(mode="json") (rather than str()) keeps the hash
+    stable and type-safe across dates, enums, and floats.
+    """
+    canonical = {
+        "employee": request.employee.model_dump(mode="json"),
+        "backlog_task": request.backlog_task.model_dump(mode="json"),
+        "timesheet_entries": sorted(
+            (entry.model_dump(mode="json") for entry in request.timesheet_entries),
+            key=lambda entry: entry["entry_id"],
+        ),
+        "report_type": request.report_type.value,
+        "start_date": request.start_date.isoformat(),
+        "end_date": request.end_date.isoformat(),
+    }
+    canonical_json = json.dumps(canonical, sort_keys=True, default=str)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 # ==============================================================
@@ -674,8 +936,10 @@ def get_llm_review(prompt: str) -> LLMReviewResult:
     API errors fail immediately without retrying.
 
     Raises:
-        HTTPException: 401 on authentication failure, 502 on a permanent
-        API error or once retries are exhausted.
+        TaskReviewError: with a safe, client-facing error_type/message and
+        the HTTP status code the caller should use if this is the only
+        task being reviewed. Full technical detail is always logged here,
+        server-side only, before the safe error is raised.
     """
     last_error: Optional[Exception] = None
 
@@ -695,15 +959,26 @@ def get_llm_review(prompt: str) -> LLMReviewResult:
             return LLMReviewResult.model_validate(parsed)
 
         except GroqAuthenticationFailure as exc:
-            raise HTTPException(
+            logger.error("Authentication with the AI service failed: %s", exc)
+            raise TaskReviewError(
+                error_type="AuthenticationFailure",
+                message=(
+                    "The task could not be reviewed because authentication "
+                    "with the AI service failed. Please contact the system "
+                    "administrator."
+                ),
                 status_code=401,
-                detail="Authentication with the Groq API failed. Check GROQ_API_KEY.",
             ) from exc
 
         except GroqPermanentFailure as exc:
-            raise HTTPException(
+            logger.error("The AI service returned a non-retryable error: %s", exc)
+            raise TaskReviewError(
+                error_type="AIServiceFailure",
+                message=(
+                    "The task could not be reviewed because the AI service "
+                    "returned an error."
+                ),
                 status_code=502,
-                detail=f"The Groq API returned a non-retryable error: {exc}",
             ) from exc
 
         except GroqRateLimitFailure as exc:
@@ -737,15 +1012,40 @@ def get_llm_review(prompt: str) -> LLMReviewResult:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
 
     logger.error(
-        "LLM failed to produce a valid review after %d attempts.", MAX_LLM_RETRIES
+        "LLM failed to produce a valid review after %d attempts. Last error (%s): %s",
+        MAX_LLM_RETRIES,
+        type(last_error).__name__ if last_error else "unknown",
+        last_error,
     )
-    raise HTTPException(
-        status_code=502,
-        detail=(
-            f"The AI model failed to return a valid review after "
-            f"{MAX_LLM_RETRIES} attempts: {last_error}"
+
+    if isinstance(last_error, GroqRateLimitFailure):
+        raise TaskReviewError(
+            error_type="GroqRateLimitFailure",
+            message=(
+                "The task could not be reviewed because the AI service was "
+                "temporarily unavailable."
+            ),
+            status_code=502,
+        ) from last_error
+
+    if isinstance(last_error, (json.JSONDecodeError, ValidationError)):
+        raise TaskReviewError(
+            error_type="InvalidAIResponse",
+            message=(
+                "The task could not be reviewed because the AI service "
+                "returned a response that could not be processed."
+            ),
+            status_code=502,
+        ) from last_error
+
+    raise TaskReviewError(
+        error_type="AIServiceTransientFailure",
+        message=(
+            "The task could not be reviewed because of a temporary AI "
+            "service issue. Please retry."
         ),
-    )
+        status_code=502,
+    ) from last_error
 
 
 # ==============================================================
@@ -761,7 +1061,7 @@ def assemble_response(
     """Combine the LLM's validated reasoning with the locally computed figures.
 
     Raises:
-        HTTPException: 502 if the merged payload fails schema validation.
+        TaskReviewError: 502, if the merged payload fails schema validation.
     """
     try:
         payload = {
@@ -785,10 +1085,81 @@ def assemble_response(
 
     except ValidationError as exc:
         logger.error("Merged review payload failed schema validation: %s", exc)
-        raise HTTPException(
+        raise TaskReviewError(
+            error_type="ResponseValidationFailure",
+            message=(
+                "The task could not be reviewed because the AI-generated "
+                "review failed validation."
+            ),
             status_code=502,
-            detail=f"The AI model response failed schema validation: {exc}",
         ) from exc
+
+
+# ==============================================================
+# 13b. SHARED SINGLE-TASK REVIEW PIPELINE
+# ==============================================================
+
+
+def process_single_task_review(
+    request: TimesheetReviewRequest,
+) -> TimesheetReviewResponse:
+    """Run the complete review pipeline for exactly one backlog task.
+
+    This is the single reusable core used by both the single-task endpoint
+    and (once per task, independently) by the bulk endpoint:
+
+        0. Check the review cache for an identical, previously-reviewed
+           (employee, task, entries, period) combination.
+        1. Calculate the effort summary locally in Python.
+        2. Build the LLM prompt for this task only.
+        3. Call the LLM and validate its qualitative response.
+        4. Assemble and validate the final response.
+        5. Store the result in the cache for future identical requests.
+
+    Raises:
+        TaskReviewError: on any failure in steps 2-4, with a safe,
+        client-facing error_type/message and a suggested HTTP status code.
+        Full technical detail is always logged at the point of failure.
+    """
+    cache_key: Optional[str] = None
+    if REVIEW_CACHE_ENABLED:
+        cache_key = compute_review_cache_key(request)
+        cached_response = _review_cache.get(cache_key)
+        if cached_response is not None:
+            logger.info(
+                "Review cache hit | task_id=%s cache_key=%s",
+                request.backlog_task.task_id,
+                cache_key[:12],
+            )
+            return cached_response
+
+    effort_summary = calculate_effort_summary(
+        request.backlog_task, request.timesheet_entries
+    )
+    prompt = build_prompt(request, effort_summary)
+    llm_result = get_llm_review(prompt)
+    response = assemble_response(request, llm_result, effort_summary)
+
+    if cache_key:
+        _review_cache.set(cache_key, response)
+
+    return response
+
+
+def build_task_review_request(
+    bulk_request: "BulkTimesheetReviewRequest",
+    task_group: TaskTimesheetGroup,
+) -> TimesheetReviewRequest:
+    """Convert one task group from a bulk request into a standalone
+    TimesheetReviewRequest, reusing the shared report-level fields."""
+    return TimesheetReviewRequest(
+        report_type=bulk_request.report_type,
+        start_date=bulk_request.start_date,
+        end_date=bulk_request.end_date,
+        employee=bulk_request.employee,
+        backlog_task=task_group.backlog_task,
+        timesheet_entries=task_group.timesheet_entries,
+    )
 
 
 # ==============================================================
@@ -824,6 +1195,37 @@ def health() -> dict:
 
 
 # ==============================================================
+# 15b. REVIEW CACHE ADMIN API
+# ==============================================================
+
+
+@app.get(
+    "/api/v1/admin/cache/stats",
+    tags=["Admin"],
+    summary="View review cache statistics",
+)
+def get_cache_stats() -> dict:
+    """Return the current size and configuration of the review cache."""
+    return _review_cache.stats()
+
+
+@app.post(
+    "/api/v1/admin/cache/clear",
+    tags=["Admin"],
+    summary="Clear the review cache",
+)
+def clear_cache() -> dict:
+    """Clear all cached reviews.
+
+    Use this after a prompt or model change, or whenever a fresh review
+    is needed for tasks that were previously cached.
+    """
+    removed = _review_cache.clear()
+    logger.info("Review cache cleared | entries_removed=%d", removed)
+    return {"status": "CLEARED", "entries_removed": removed}
+
+
+# ==============================================================
 # 16. MANAGER REVIEW API
 # ==============================================================
 
@@ -854,12 +1256,16 @@ def review_timesheet(request: TimesheetReviewRequest) -> TimesheetReviewResponse
         len(request.timesheet_entries),
     )
 
-    effort_summary = calculate_effort_summary(
-        request.backlog_task, request.timesheet_entries
-    )
-    prompt = build_prompt(request, effort_summary)
-    llm_result = get_llm_review(prompt)
-    response = assemble_response(request, llm_result, effort_summary)
+    try:
+        response = process_single_task_review(request)
+    except TaskReviewError as exc:
+        logger.error(
+            "[%s] Review failed | task=%s error_type=%s",
+            review_id,
+            request.backlog_task.task_id,
+            exc.error_type,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
     logger.info(
@@ -869,6 +1275,180 @@ def review_timesheet(request: TimesheetReviewRequest) -> TimesheetReviewResponse
         elapsed_ms,
     )
     return response
+
+
+# ==============================================================
+# 16b. BULK MANAGER REVIEW API
+# ==============================================================
+
+
+def _process_one_bulk_task(
+    bulk_id: str,
+    index: int,
+    bulk_request: BulkTimesheetReviewRequest,
+    task_group: TaskTimesheetGroup,
+) -> Tuple[int, Optional[TimesheetReviewResponse], Optional[TaskReviewFailure]]:
+    """Run the review pipeline for one task within a bulk request.
+
+    Never raises - any failure (expected or unexpected) is converted into
+    a safe TaskReviewFailure so that one bad task cannot stop the rest of
+    the batch from being processed.
+    """
+    task_id = task_group.backlog_task.task_id
+    logger.info("[%s] Task start | task_id=%s", bulk_id, task_id)
+
+    try:
+        single_request = build_task_review_request(bulk_request, task_group)
+        response = process_single_task_review(single_request)
+        logger.info(
+            "[%s] Task completed | task_id=%s decision=%s",
+            bulk_id,
+            task_id,
+            response.decision.value,
+        )
+        return index, response, None
+
+    except TaskReviewError as exc:
+        logger.error(
+            "[%s] Task failed | task_id=%s error_type=%s",
+            bulk_id,
+            task_id,
+            exc.error_type,
+        )
+        return index, None, TaskReviewFailure(
+            task_id=task_id, error_type=exc.error_type, error_message=exc.message
+        )
+
+    except Exception:  # noqa: BLE001 - deliberately broad: isolate this task's failure
+        logger.exception(
+            "[%s] Task failed with an unexpected error | task_id=%s", bulk_id, task_id
+        )
+        return index, None, TaskReviewFailure(
+            task_id=task_id,
+            error_type="UnexpectedFailure",
+            error_message=(
+                "The task could not be reviewed due to an unexpected error."
+            ),
+        )
+
+
+@app.post(
+    "/api/v1/manager/timesheet-review/bulk",
+    response_model=BulkTimesheetReviewResponse,
+    tags=["Manager Review"],
+    summary="Review multiple backlog tasks for one employee in a single request",
+)
+def review_timesheet_bulk(
+    request: BulkTimesheetReviewRequest,
+) -> BulkTimesheetReviewResponse:
+    """Review multiple backlog tasks for one employee, each independently.
+
+    Every task is sent to the LLM as its own isolated review (never
+    combined with other tasks in one prompt), using the exact same
+    pipeline as the single-task endpoint via ``process_single_task_review``.
+    A failure on one task never stops the others from being processed.
+    All aggregate totals are computed locally in Python, never by the LLM.
+    """
+    bulk_id = uuid4().hex[:8]
+    started_at = time.perf_counter()
+    logger.info(
+        "[%s] Starting bulk review | employee=%s tasks=%d",
+        bulk_id,
+        request.employee.employee_id,
+        len(request.tasks),
+    )
+
+    results_by_index: Dict[int, TimesheetReviewResponse] = {}
+    failures_by_index: Dict[int, TaskReviewFailure] = {}
+
+    def _run_sequentially() -> None:
+        results_by_index.clear()
+        failures_by_index.clear()
+        for i, task_group in enumerate(request.tasks):
+            idx, response, failure = _process_one_bulk_task(
+                bulk_id, i, request, task_group
+            )
+            if response is not None:
+                results_by_index[idx] = response
+            else:
+                failures_by_index[idx] = failure  # type: ignore[assignment]
+
+    max_workers = min(BULK_MAX_WORKERS, len(request.tasks))
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_process_one_bulk_task, bulk_id, i, request, task_group)
+                for i, task_group in enumerate(request.tasks)
+            ]
+            for future in as_completed(futures):
+                idx, response, failure = future.result()
+                if response is not None:
+                    results_by_index[idx] = response
+                else:
+                    failures_by_index[idx] = failure  # type: ignore[assignment]
+
+    except Exception:  # noqa: BLE001 - parallel execution failed; fall back safely
+        logger.exception(
+            "[%s] Parallel bulk processing failed; falling back to sequential.",
+            bulk_id,
+        )
+        _run_sequentially()
+
+    # Preserve input task order within each of the two result lists.
+    ordered_results = [results_by_index[i] for i in sorted(results_by_index)]
+    ordered_failures = [failures_by_index[i] for i in sorted(failures_by_index)]
+
+    total_tasks = len(request.tasks)
+    completed_tasks = len(ordered_results)
+    failed_tasks = len(ordered_failures)
+    accepted_tasks = sum(1 for r in ordered_results if r.decision == Decision.ACCEPT)
+    review_tasks = sum(1 for r in ordered_results if r.decision == Decision.REVIEW)
+    correction_required_tasks = sum(
+        1 for r in ordered_results if r.decision == Decision.CORRECTION_REQUIRED
+    )
+    total_planned_hours = round(
+        sum(r.effort_summary.total_planned_hours for r in ordered_results), 2
+    )
+    total_actual_hours = round(
+        sum(r.effort_summary.total_actual_hours for r in ordered_results), 2
+    )
+
+    if failed_tasks == 0:
+        bulk_status = "COMPLETED"
+    elif completed_tasks == 0:
+        bulk_status = "FAILED"
+    else:
+        bulk_status = "PARTIALLY_COMPLETED"
+
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+    logger.info(
+        "[%s] Bulk review completed | status=%s completed=%d failed=%d elapsed_ms=%s",
+        bulk_id,
+        bulk_status,
+        completed_tasks,
+        failed_tasks,
+        elapsed_ms,
+    )
+
+    return BulkTimesheetReviewResponse(
+        status=bulk_status,
+        employee_id=request.employee.employee_id,
+        employee_name=request.employee.employee_name,
+        report_type=request.report_type,
+        review_period=ReviewPeriod(
+            start_date=request.start_date, end_date=request.end_date
+        ),
+        total_tasks=total_tasks,
+        completed_tasks=completed_tasks,
+        failed_tasks=failed_tasks,
+        accepted_tasks=accepted_tasks,
+        review_tasks=review_tasks,
+        correction_required_tasks=correction_required_tasks,
+        total_planned_hours=total_planned_hours,
+        total_actual_hours=total_actual_hours,
+        results=ordered_results,
+        failures=ordered_failures,
+    )
 
 
 # ==============================================================

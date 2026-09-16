@@ -20,6 +20,11 @@ deploy/
 └── docker-compose.yml
 ```
 
+> **Current setup:** the nginx service in `docker-compose.yml` is commented
+> out. Agent 1 and Agent 2 are published on `127.0.0.1:8001` and
+> `127.0.0.1:8002` (localhost only) and should be exposed through a reverse
+> proxy on the host (e.g. Caddy). Redis runs as a compose service for Agent 1.
+
 ## 1. Set up environment variables
 
 ```bash
@@ -44,6 +49,11 @@ This builds both agent images, starts them, and starts nginx in front.
 ## 3. Verify
 
 ```bash
+# direct (current setup)
+curl http://127.0.0.1:8001/health/ready
+curl http://127.0.0.1:8002/health
+
+# through the nginx gateway (only if nginx is enabled)
 curl http://localhost/agent1/health
 curl http://localhost/agent2/health
 ```
@@ -60,6 +70,27 @@ Both should return a JSON status.
 **Agent 2 — Timesheet Review**
 - `POST /agent2/api/v1/manager/timesheet-review`
 
+## Redis (Agent 1)
+
+- Started automatically by compose; Agent 1 waits until it is healthy.
+- Data persists in the `redis-data` volume (append-only file).
+- Not published on any port - only the agents can reach it.
+- Check: `curl http://127.0.0.1:8001/health/ready` -> `"redis": "connected"`.
+- **Never run `docker compose down -v`** - it deletes all cached results and
+  pinned estimates.
+
+## Example Caddy config (host)
+
+```
+agent1.yourdomain.com {
+    reverse_proxy 127.0.0.1:8001
+}
+
+agent2.yourdomain.com {
+    reverse_proxy 127.0.0.1:8002
+}
+```
+
 ## 5. Logs / management
 
 ```bash
@@ -69,7 +100,7 @@ docker compose logs -f nginx
 
 docker compose restart agent1   # restart just one service, the other stays up
 
-docker compose down             # stop everything
+docker compose down             # stop everything (keeps Redis data)
 ```
 
 ## Notes for whoever deploys this (e.g. your TL)

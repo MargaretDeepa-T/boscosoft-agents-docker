@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   agent1:
     build: ./agent1
@@ -7,8 +5,38 @@ services:
     restart: unless-stopped
     env_file:
       - ./agent1/.env
+    environment:
+      # Compose-managed Redis always wins over whatever REDIS_URL (if any)
+      # is set in agent1/.env, so the container talks to the "redis"
+      # service by name regardless of local dev settings.
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Bound to localhost only: reach it through the reverse proxy
+    # (Caddy/nginx) on the same server. Docker bypasses ufw, so a plain
+    # "8001:8000" would expose the API publicly without HTTPS.
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
+    networks:
+      - agents-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: boscosoft-redis
+    restart: unless-stopped
+    # --appendonly yes + the named volume: cached results and pinned
+    # canonical estimates survive container restarts and redeploys.
+    # Never run "docker compose down -v" - it deletes this volume.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No "ports:" on purpose - Redis is reachable only by the agents.
     networks:
       - agents-net
 
@@ -19,7 +47,7 @@ services:
     env_file:
       - ./agent2/.env
     ports:
-      - "8002:8000"
+      - "127.0.0.1:8002:8000"
     networks:
       - agents-net
 
@@ -40,3 +68,6 @@ services:
 networks:
   agents-net:
     driver: bridge
+
+volumes:
+  redis-data:

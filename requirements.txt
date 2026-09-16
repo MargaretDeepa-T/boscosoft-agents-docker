@@ -1,0 +1,5 @@
+# Local development / testing only.
+# Docker images install agent1/requirements.txt and agent2/requirements.txt.
+-r agent1/requirements.txt
+pytest
+httpx
