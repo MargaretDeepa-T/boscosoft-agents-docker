@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -11,8 +12,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 
+import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from groq import (
     APIConnectionError,
     APIStatusError,
@@ -61,6 +63,32 @@ GROQ_REQUEST_TIMEOUT_SECONDS = int(
 MAX_LLM_RETRIES = int(os.getenv("MAX_LLM_RETRIES", "3"))
 RETRY_BACKOFF_SECONDS = float(os.getenv("RETRY_BACKOFF_SECONDS", "1.5"))
 
+# openai/gpt-oss-* models on Groq spend part of their output budget on
+# internal reasoning before writing the final JSON, and that reasoning
+# counts against max_completion_tokens. With a low ceiling, the model can
+# burn the whole budget "thinking" and get cut off before it ever emits a
+# complete JSON object - this surfaces as Groq's 400 json_validate_failed
+# ("max completion tokens reached before generating a valid document"),
+# not as a sampling fluke. Two knobs address this directly:
+#   - GROQ_REASONING_EFFORT: "low" keeps the model from over-reasoning on
+#     what is, per the system prompt, a fairly mechanical classification
+#     task - this also helps the CONSISTENCY requirement, since less
+#     reasoning means less run-to-run variance.
+#   - GROQ_MAX_COMPLETION_TOKENS: raised from the previous hardcoded 1200
+#     to leave headroom for reasoning tokens + the actual JSON payload.
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low").strip()
+GROQ_MAX_COMPLETION_TOKENS = int(
+    os.getenv("GROQ_MAX_COMPLETION_TOKENS", "2000")
+)
+# On a json_validate_failed retry specifically, repeating the identical
+# request with the identical token budget tends to fail the same way
+# again (it's a budget problem, not a transient one) - each retry adds
+# this many tokens to the ceiling so a retry actually has a different
+# chance of succeeding.
+GROQ_COMPLETION_TOKENS_RETRY_STEP = int(
+    os.getenv("GROQ_COMPLETION_TOKENS_RETRY_STEP", "500")
+)
+
 # Long descriptions cost tokens without adding validation value beyond a
 # point; truncating keeps a single task from eating a disproportionate
 # share of the per-minute token budget.
@@ -85,7 +113,6 @@ _groq_concurrency_gate = threading.Semaphore(GROQ_MAX_CONCURRENT_REQUESTS)
 app = FastAPI(
     title="Boscosoft Task Validation API",
     version="1.3.0",
-    root_path="/agent1",
 )
 
 
@@ -799,6 +826,110 @@ def truncate_for_prompt(
     return text[:max_chars].rstrip() + " …[truncated for length]"
 
 
+def normalize_header(value: Any) -> str:
+    text = clean_text(value).lower()
+    text = text.replace("_", " ")
+    text = text.replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+COLUMN_ALIASES = {
+    "task_id": {"task id", "taskid"},
+    "module_name": {"module name", "modulename", "module"},
+    "feature_name": {"feature name", "featurename", "feature"},
+    "task_title": {
+        "task title",
+        "tasktitle",
+        "task name",
+        "taskname",
+        "task",
+    },
+    "task_description": {
+        "task description",
+        "taskdescription",
+        "description",
+    },
+    "estimated_hours": {
+        "estimate hrs",
+        "estimatehrs",
+        "estimated hours",
+        "estimated hrs",
+        "est hrs",
+        "est. hrs",
+        "planned hours",
+        "planned_hours",
+    },
+    "complexity": {"complexity"},
+    "project_tag": {
+        "project tag",
+        "projecttag",
+        "project",
+    },
+    "assignee": {
+        "assign to",
+        "assigned to",
+        "assignee",
+        "employee name",
+        "employeename",
+    },
+}
+
+
+def get_value(
+    row: dict[str, Any],
+    logical_field: str,
+) -> Any:
+    aliases = COLUMN_ALIASES[logical_field]
+
+    for column, value in row.items():
+        if normalize_header(column) in aliases:
+            return value
+
+    return ""
+
+
+def hours_to_decimal(value: Any) -> float:
+    if value is None:
+        return 0.0
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+
+        if pd.isna(number):
+            return 0.0
+
+        if 0 < number < 1:
+            return round(number * 24, 2)
+
+        return round(number, 2)
+
+    text = clean_text(value).lower()
+
+    if not text:
+        return 0.0
+
+    match = re.fullmatch(
+        r"(\d+):(\d{1,2})(?::(\d{1,2}))?",
+        text,
+    )
+
+    if match:
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        seconds = int(match.group(3) or 0)
+
+        return round(
+            hours + minutes / 60 + seconds / 3600,
+            2,
+        )
+
+    number_match = re.search(r"\d+(?:\.\d+)?", text)
+
+    if number_match:
+        return float(number_match.group())
+
+    return 0.0
+
 
 def build_prompt(
     task: TaskInput,
@@ -1473,7 +1604,10 @@ def _is_json_validate_failed(exc: APIStatusError) -> bool:
     return "json_validate_failed" in str(exc)
 
 
-def call_groq_llm(user_prompt: str) -> str:
+def call_groq_llm(
+    user_prompt: str,
+    max_completion_tokens: int = GROQ_MAX_COMPLETION_TOKENS,
+) -> str:
     """Call the Groq chat completion API and return the raw text response.
 
     Bounded by GROQ_MAX_CONCURRENT_REQUESTS so a bulk validation batch
@@ -1492,7 +1626,8 @@ def call_groq_llm(user_prompt: str) -> str:
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
                 temperature=0,
-                max_completion_tokens=1200,
+                max_completion_tokens=max_completion_tokens,
+                reasoning_effort=GROQ_REASONING_EFFORT,
                 messages=[
                     {
                         "role": "system",
@@ -1556,7 +1691,20 @@ def request_groq_validation(
 
     for attempt in range(1, MAX_LLM_RETRIES + 1):
         try:
-            raw = call_groq_llm(user_prompt)
+            # Escalate the completion-token ceiling on each retry. A
+            # json_validate_failed (or any other transient failure) isn't
+            # helped by repeating the identical request with the identical
+            # budget - reasoning-model output can get cut off before a
+            # complete JSON object is written, and that failure mode
+            # reproduces deterministically at temperature=0 unless the
+            # budget itself changes.
+            attempt_max_tokens = GROQ_MAX_COMPLETION_TOKENS + (
+                GROQ_COMPLETION_TOKENS_RETRY_STEP * (attempt - 1)
+            )
+            raw = call_groq_llm(
+                user_prompt,
+                max_completion_tokens=attempt_max_tokens,
+            )
 
             if not raw:
                 raise RuntimeError("Groq returned an empty response")
@@ -1601,10 +1749,12 @@ def request_groq_validation(
         ) as exc:
             last_error = exc
             logger.warning(
-                "Groq attempt %d/%d failed (%s): %s",
+                "Groq attempt %d/%d failed (%s) with max_completion_tokens="
+                "%d: %s",
                 attempt,
                 MAX_LLM_RETRIES,
                 type(exc).__name__,
+                attempt_max_tokens,
                 exc,
             )
             if attempt < MAX_LLM_RETRIES:
@@ -1860,20 +2010,76 @@ def validate_tasks_concurrently(
         if result is not None
     ]
 
+def dataframe_to_tasks(
+    dataframe: pd.DataFrame,
+) -> list[TaskInput]:
+    tasks: list[TaskInput] = []
 
-def build_bulk_response(results: list[ValidationResult]) -> BulkResponse:
-    """Summarize a batch of per-task ValidationResults into a BulkResponse.
+    for index, row in dataframe.iterrows():
+        record = row.to_dict()
 
-    A task counts as failed if its decision came back as ERROR (see
-    validation_error_result / validate_with_groq); everything else counts
-    as validated, regardless of which non-ERROR decision it received.
-    """
-    total = len(results)
-    failed = sum(1 for result in results if result.decision == "ERROR")
-    validated = total - failed
+        task_title = clean_text(
+            get_value(record, "task_title")
+        )
 
-    if total == 0 or failed == 0:
-        status: Literal["COMPLETED", "PARTIALLY_COMPLETED", "FAILED"] = "COMPLETED"
+        if not task_title:
+            continue
+
+        task_id = clean_text(
+            get_value(record, "task_id")
+        )
+
+        if not task_id:
+            task_id = f"ROW-{index + 2}"
+
+        tasks.append(
+            TaskInput(
+                task_id=task_id,
+                module_name=clean_text(
+                    get_value(record, "module_name")
+                ),
+                feature_name=clean_text(
+                    get_value(record, "feature_name")
+                ),
+                task_title=task_title,
+                task_description=clean_text(
+                    get_value(
+                        record,
+                        "task_description",
+                    )
+                ),
+                estimated_hours=hours_to_decimal(
+                    get_value(
+                        record,
+                        "estimated_hours",
+                    )
+                ),
+                complexity=clean_text(
+                    get_value(record, "complexity")
+                ),
+                project_tag=clean_text(
+                    get_value(record, "project_tag")
+                ),
+                assignee=clean_text(
+                    get_value(record, "assignee")
+                ),
+            )
+        )
+
+    return tasks
+
+
+def build_bulk_response(
+    results: list[ValidationResult],
+) -> BulkResponse:
+    failed = sum(
+        result.decision == "ERROR"
+        for result in results
+    )
+    validated = len(results) - failed
+
+    if failed == 0:
+        status = "COMPLETED"
     elif validated == 0:
         status = "FAILED"
     else:
@@ -1881,7 +2087,7 @@ def build_bulk_response(results: list[ValidationResult]) -> BulkResponse:
 
     return BulkResponse(
         status=status,
-        total_tasks=total,
+        total_tasks=len(results),
         validated_tasks=validated,
         failed_tasks=failed,
         results=results,
@@ -2043,3 +2249,53 @@ def validate_backlog_json(
     )
 
     return build_bulk_response(results)
+
+
+@app.post(
+    "/api/v1/backlog/upload-and-validate",
+    response_model=BulkResponse,
+)
+async def upload_and_validate(
+    file: UploadFile = File(...),
+) -> BulkResponse:
+    """Optional Excel endpoint retained for manual testing."""
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename is missing",
+        )
+
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only .xlsx files are supported",
+        )
+
+    try:
+        file_bytes = await file.read()
+
+        dataframe = pd.read_excel(
+            io.BytesIO(file_bytes),
+            engine="openpyxl",
+        )
+
+        tasks = dataframe_to_tasks(dataframe)
+
+        if not tasks:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid tasks found in workbook",
+            )
+
+        results = validate_tasks_concurrently(tasks)
+
+        return build_bulk_response(results)
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Validation failed: {error}",
+        ) from error
