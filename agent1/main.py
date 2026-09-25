@@ -114,6 +114,7 @@ _groq_concurrency_gate = threading.Semaphore(GROQ_MAX_CONCURRENT_REQUESTS)
 app = FastAPI(
     title="Boscosoft Task Validation API",
     version="1.4.0",
+    root_path ="/agent1"
 )
 
 
@@ -452,7 +453,7 @@ Immediately return decision = CANNOT_VALIDATE_ESTIMATE with the following field 
 - "suggested_task_title": return the original title unchanged. Do not invent a new title.
 - "suggested_task_description": return the original description unchanged (or an empty-input placeholder such as "No description provided" if the original was truly empty/whitespace/null). Do not invent content.
 - "suggested_estimated_hours": null. Do NOT return the original estimated_hours, do NOT return 0, and do NOT produce any estimate.
-- "recommendation": "Insufficient task description. Please update the task details and resubmit for estimation."
+- "recommendation": "Insufficient task description. Please update and resubmit for Agent 1 estimation."
 
 A description that merely restates the task title, or adds only a product/module name without saying what work must be done (e.g. "Front end design for dashboard in CHMS parish portal.etc"), is insufficient.
 
@@ -783,7 +784,7 @@ Everything changed
 
 Description insufficient (CANNOT_VALIDATE_ESTIMATE)
 
-"Insufficient task description. Please update the task details and resubmit for estimation."
+"Insufficient task description. Please update and resubmit for Agent 1 estimation."
 
 The recommendation MUST always agree with the assessment fields and with the decision value.
 
