@@ -9,15 +9,49 @@ estimates so the same task always gets the same answer.
 | Method | Path | Notes |
 |---|---|---|
 | GET  | `/health`, `/health/live`, `/health/ready` | `ready` also reports Redis status |
-| POST | `/api/v1/task/validate` | single task (JSON) |
-| POST | `/api/v1/backlog/validate` | bulk tasks (JSON) |
-| POST | `/api/v1/backlog/upload-and-validate` | bulk tasks (`.xlsx` upload) |
-| GET  | `/api/v1/cache/stats` | cache / pinned-estimate counts |
-| POST | `/api/v1/cache/clear` | force fresh validation for every task |
+| POST | `/api/v1/task/validate` | single task (JSON), standard mode |
+| POST | `/api/v1/task/validate-ai-assisted` | single task (JSON), AI-assisted mode |
+| POST | `/api/v1/backlog/validate` | bulk tasks (JSON), standard mode |
+| POST | `/api/v1/backlog/validate-ai-assisted` | bulk tasks (JSON), AI-assisted mode |
+| POST | `/api/v1/backlog/upload-and-validate` | bulk tasks (`.xlsx` upload), standard mode |
+| GET  | `/api/v1/cache/stats` | cache / pinned-estimate counts (standard + AI-assisted) |
+| POST | `/api/v1/cache/clear` | force fresh validation for every task, both modes |
 
 > The API has **no authentication** of its own. Keep it bound to
 > localhost (see `docker-compose.yml`) and expose it only through the
 > reverse proxy.
+
+## AI-Assisted Estimation mode
+
+The `-ai-assisted` endpoints accept the exact same request body as their
+standard counterparts (`TaskInput` / `BulkTaskValidationRequest`) and
+return the exact same response shape (`SingleTaskResponse` /
+`BulkResponse`), so any UI already rendering an Agent 1 result can
+render an AI-assisted result unchanged - only the button/endpoint the
+UI calls differs.
+
+What's different in AI-assisted mode:
+
+- Effort is assessed assuming the task will be implemented with
+  AI-assisted development tools. The model first independently derives
+  an AI-assisted effort figure from the task's scope alone - without
+  looking at the submitted `estimated_hours` - by reasoning about which
+  parts of the described work AI tools can realistically accelerate and
+  which parts remain human-dependent. Only after that independent
+  derivation does it compare the result with the submitted estimate and
+  apply the same decision rules (`PROCEED`, `REVIEW_ESTIMATE`,
+  `REWRITE_TASK`, `REWRITE_AND_REESTIMATE`, `CANNOT_VALIDATE_ESTIMATE`).
+- There is **no fixed AI productivity discount**. The same task can
+  legitimately get a lower, similar, or identical AI-assisted estimate
+  compared to standard mode, depending on how much of its real work is
+  AI-accelerable.
+- The insufficient-description rule (`CANNOT_VALIDATE_ESTIMATE`) is
+  identical in both modes and always takes priority: AI assistance
+  never compensates for a missing/vague description.
+- Standard and AI-assisted results are cached and pinned completely
+  separately (see Consistency (Redis) below) - validating a task in one
+  mode never returns or contaminates the other mode's result, even for
+  the exact same task content.
 
 ## Decisions
 
@@ -64,6 +98,11 @@ Rows without a title are skipped. Rows without a Task ID get `ROW-<n>`.
   canonical estimate, no LLM call.
 - Changed title/description/scope -> fresh validation.
 - Call `/api/v1/cache/clear` after changing the prompt.
+- Standard mode uses Redis key prefixes `agent1:validation:` /
+  `agent1:canonical:` (unchanged since before AI-assisted mode existed).
+  AI-assisted mode uses separate prefixes `agent1ai:validation:` /
+  `agent1ai:canonical:`, so the two modes can never share, overwrite, or
+  return each other's cached/pinned result for the same task.
 
 Without Redis the service still works, but the cache is in-memory and resets
 on every restart.
@@ -82,8 +121,13 @@ uvicorn main:app --reload
 Groq is mocked, so no key or network is needed:
 
 ```cmd
-set GROQ_API_KEY=dummy && pytest -q test_cannot_validate.py
+set GROQ_API_KEY=dummy && pytest -q test_cannot_validate.py test_ai_assisted.py
 ```
+
+`test_cannot_validate.py` covers the original standard-mode behavior.
+`test_ai_assisted.py` covers the AI-assisted endpoints: independent
+estimation, no fixed discount, insufficient-description handling, and
+cache isolation between modes.
 
 Run tests in a separate terminal from the server - the dummy key otherwise
 overrides the real key in `.env`.
